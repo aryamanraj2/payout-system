@@ -1,16 +1,11 @@
-"""Stage 5.3: the webhook endpoint, exercised through the real HTTP stack.
-
-Everything here goes through TestClient -- routers, Pydantic serialisation,
-and the DomainError -> HTTP exception handler -- because none of that is
-touched by the service-level tests.
-"""
+"""Webhook endpoint and full flow through the HTTP stack."""
 
 import pytest
 
 
 @pytest.fixture
 def payout_id(client):
-    """A live initiated payout of Rs 68, built entirely over HTTP."""
+    """An initiated payout of Rs 68, set up entirely over HTTP."""
     sale_ids = [
         client.post(
             "/sales",
@@ -40,7 +35,6 @@ def test_webhook_advances_payout_status(client, payout_id):
 
 
 def test_webhook_failure_credits_balance(client, payout_id):
-    """Q2 over HTTP: the gateway reports failure, the balance comes back."""
     assert _balance(client) == "0.00"
 
     r = client.post(f"/webhooks/payouts/{payout_id}", json={"status": "failed"})
@@ -49,15 +43,13 @@ def test_webhook_failure_credits_balance(client, payout_id):
     assert r.json()["status"] == "failed"
     assert _balance(client) == "68.00"
 
-    # The audit trail shows both movements.
     types = [e["entry_type"] for e in client.get("/users/john_doe/ledger").json()]
     assert types.count("WITHDRAWAL_DEBIT") == 1
     assert types.count("WITHDRAWAL_REVERSAL") == 1
 
 
 def test_webhook_redelivery_returns_200_and_credits_once(client, payout_id):
-    """Gateways retry until they see 2xx. A redelivery must therefore get 200,
-    not 409 -- an error would make the gateway retry forever."""
+    # gateways retry until they see 2xx, so a redelivery must not be an error
     first = client.post(f"/webhooks/payouts/{payout_id}", json={"status": "failed"})
     second = client.post(f"/webhooks/payouts/{payout_id}", json={"status": "failed"})
 
@@ -76,7 +68,6 @@ def test_webhook_illegal_transition_is_409(client, payout_id):
     body = r.json()
     assert body["error"] == "invalid_transition"
     assert "completed -> failed" in body["detail"]
-    # And no money moved.
     assert _balance(client) == "0.00"
 
 
@@ -88,53 +79,39 @@ def test_webhook_unknown_payout_is_404(client, john):
 
 def test_webhook_invalid_status_is_422(client, payout_id):
     r = client.post(f"/webhooks/payouts/{payout_id}", json={"status": "exploded"})
-    assert r.status_code == 422  # Pydantic rejects it before the service runs
-
-
-# --------------------------------------------------------------------------
-# Stage 5.4: the whole assignment in one test, over HTTP.
-# --------------------------------------------------------------------------
+    assert r.status_code == 422
 
 
 def test_q2_full_cycle_over_http(client, payout_id):
-    """The complete Q2 story through the public API.
-
-    A rate-limited user's payout fails; they must be able to withdraw again
-    immediately. The 429 assertions in the middle prove the second withdrawal
-    succeeds *because of* the failure handling, not because the rate limit
-    was never in play.
-    """
-    # The 24h slot is occupied by the initiated payout...
+    """Rate-limited user -> payout fails -> can withdraw again immediately.
+    The 429 in the middle shows the second withdrawal succeeds because of the
+    failure handling, not because the limit was never in play."""
     r = client.post("/users/john_doe/withdrawals", json={"amount": 1.00})
     assert r.status_code == 429
     assert "retry_after" in r.json()
     assert int(r.headers["Retry-After"]) > 0
 
-    # ...the gateway fails the payout...
     r = client.post(f"/webhooks/payouts/{payout_id}", json={"status": "failed"})
     assert r.status_code == 200
     assert _balance(client) == "68.00"
 
-    # ...and the same user can now withdraw again, immediately.
     r = client.post("/users/john_doe/withdrawals", json={"amount": 68.00})
     assert r.status_code == 201
     retry_id = r.json()["id"]
     assert retry_id != payout_id
     assert _balance(client) == "0.00"
 
-    # The retry completes; nothing comes back this time.
     client.post(f"/webhooks/payouts/{retry_id}", json={"status": "processing"})
     r = client.post(f"/webhooks/payouts/{retry_id}", json={"status": "completed"})
     assert r.status_code == 200
     assert _balance(client) == "0.00"
 
-    # Final audit trail: the ledger tells the entire story in order.
     types = [e["entry_type"] for e in client.get("/users/john_doe/ledger").json()]
     assert types == [
-        "REJECTION_ADJUSTMENT",   # sale rejected:        -4
-        "FINAL_CREDIT",           # sale approved:       +36
-        "FINAL_CREDIT",           # sale approved:       +36
-        "WITHDRAWAL_DEBIT",       # first withdrawal:    -68
-        "WITHDRAWAL_REVERSAL",    # gateway failure:     +68
-        "WITHDRAWAL_DEBIT",       # retry withdrawal:    -68
+        "REJECTION_ADJUSTMENT",
+        "FINAL_CREDIT",
+        "FINAL_CREDIT",
+        "WITHDRAWAL_DEBIT",
+        "WITHDRAWAL_REVERSAL",
+        "WITHDRAWAL_DEBIT",
     ]

@@ -1,35 +1,13 @@
-"""Payout lifecycle updates from the payment gateway (Q2).
+"""Payout status updates from the gateway, including Q2 failure recovery.
 
-Two layers:
+Same status again -> no-op (gateways redeliver webhooks). Legal transition ->
+apply. Anything else -> 409. When a payout lands in failed/cancelled/rejected,
+the amount is credited back as a WITHDRAWAL_REVERSAL entry — the original
+debit is never touched, the ledger keeps both rows.
 
-1. The transition core. The gateway reports status changes -- possibly late,
-   duplicated, or out of order -- and the state machine decides which are
-   legal:
-
-    same status again   -> no-op, return the payout unchanged. Gateways
-                           redeliver webhooks; a redelivery is not an error.
-    legal transition    -> apply it and bump updated_at.
-    anything else       -> InvalidTransition (409). Terminal states have no
-                           outgoing edges, so a completed payout can never
-                           become failed.
-
-2. The recovery (Q2). When a payout lands in a terminal failure --
-   failed, cancelled, or rejected -- the debited amount is credited back to
-   the withdrawable balance as a WITHDRAWAL_REVERSAL entry.
-
-   The reversal is a COMPENSATING ENTRY, never a mutation or deletion of the
-   original debit. The audit trail permanently shows both: debit -68,
-   reversal +68. A balance that says 68 again is the *sum* telling the truth,
-   not history being rewritten.
-
-   Double-credit is impossible twice over, by two independent mechanisms:
-     - the state machine: a payout already in a terminal state accepts no
-       further transitions, so the reversal code is unreachable a second time;
-     - the ledger's UNIQUE idempotency key `reversal:{payout_id}`: even if the
-       state machine were somehow bypassed (bug, manual DB edit, a future
-       refactor), the second INSERT collides and is swallowed as a no-op.
-   Belt and braces, because this is the one place the system creates balance
-   out of thin air.
+A double credit is blocked twice over: terminal states have no exits in the
+state machine, and the reversal:{payout_id} unique key rejects a second
+insert even if the state were somehow rewound.
 """
 
 from sqlalchemy.exc import IntegrityError
@@ -44,25 +22,16 @@ from app.state_machine import TERMINAL_FAILURE, can_transition
 def handle_payout_status_update(
     db: Session, payout_id: str, new_status: PayoutStatus
 ) -> Payout:
-    """Apply a gateway-reported status change to a payout.
-
-    Idempotent for redeliveries: reporting the current status again is a
-    no-op, not a conflict.
-    """
-    # with_for_update: no-op on SQLite (BEGIN IMMEDIATE already holds the
-    # write lock), real row lock on Postgres -- same pattern as reconciliation.
+    # row lock on Postgres; no-op on SQLite
     payout = db.get(Payout, payout_id, with_for_update=True)
     if payout is None:
         raise NotFound(f"payout {payout_id} not found")
 
     if new_status == payout.status:
-        return payout  # duplicate webhook: swallow silently
+        return payout  # duplicate webhook
 
     if not can_transition(payout.status, new_status):
-        # .value on both sides: an f-string on a str-Enum member renders
-        # "PayoutStatus.COMPLETED" on Python 3.11+, and payout.status is a
-        # plain str or an enum depending on whether the row came from the DB
-        # or this session. Normalise so clients always see "completed".
+        # .value: f-strings on str-enums print "PayoutStatus.X" on 3.11+
         raise InvalidTransition(
             f"payout {payout_id} cannot go "
             f"{PayoutStatus(payout.status).value} -> {new_status.value}"
@@ -79,19 +48,9 @@ def handle_payout_status_update(
 
 
 def _write_reversal(db: Session, payout: Payout) -> None:
-    """Credit the failed payout back, exactly once.
-
-    The savepoint is the load-bearing part. A duplicate `reversal:{id}` key
-    raises IntegrityError inside begin_nested(), which rolls back only the
-    savepoint and leaves the status change (made outside it) intact. Removing
-    the savepoint was tested: the duplicate key then poisons the whole session
-    (PendingRollbackError) and the status change is lost with it.
-
-    The explicit flush, honestly, is redundant -- exiting begin_nested()
-    commits the savepoint and that commit flushes, still inside this try. It
-    stays because it pins the failure to a named line instead of a context
-    manager exit, which makes the traceback readable.
-    """
+    """Credit the failed payout back, exactly once. The savepoint means a
+    duplicate reversal key rolls back only the reversal, not the status
+    change made above it."""
     try:
         with db.begin_nested():
             db.add(
@@ -99,7 +58,7 @@ def _write_reversal(db: Session, payout: Payout) -> None:
                     id=new_id(),
                     user_id=payout.user_id,
                     entry_type=LedgerEntryType.WITHDRAWAL_REVERSAL,
-                    amount=payout.amount,  # positive: money returns
+                    amount=payout.amount,
                     payout_id=payout.id,
                     idempotency_key=f"reversal:{payout.id}",
                     created_at=utcnow(),
@@ -107,6 +66,4 @@ def _write_reversal(db: Session, payout: Payout) -> None:
             )
             db.flush()
     except IntegrityError:
-        # A reversal for this payout already exists. The user has their money;
-        # doing nothing is the correct outcome.
-        pass
+        pass  # reversal already exists, user already has the money

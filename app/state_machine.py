@@ -1,8 +1,5 @@
-"""Legal payout transitions.
-
-Terminal states have no outgoing edges, which makes `completed -> failed`
-structurally impossible rather than a check someone can forget to write.
-"""
+"""Legal payout transitions. Terminal states have no outgoing edges, so e.g.
+completed -> failed is impossible by construction."""
 
 from app.enums import PayoutStatus
 
@@ -23,7 +20,7 @@ PAYOUT_TRANSITIONS: dict[PayoutStatus, set[PayoutStatus]] = {
     PayoutStatus.REJECTED: set(),
 }
 
-# Q2: these three outcomes return the money to the withdrawable balance.
+# these credit the money back to the user's balance (Q2)
 TERMINAL_FAILURE: set[PayoutStatus] = {
     PayoutStatus.FAILED,
     PayoutStatus.CANCELLED,

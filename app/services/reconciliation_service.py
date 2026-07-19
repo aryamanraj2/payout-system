@@ -1,24 +1,11 @@
-"""Reconciliation: the final payout calculation from the assignment.
+"""Reconciliation: admin moves a pending sale to approved/rejected and the
+result is netted against any advance already paid.
 
-An administrator moves a pending sale to approved or rejected, and the system
-nets the result against whatever advance was already transferred.
+    approved:  FINAL_CREDIT          +(earning - advance)
+    rejected:  REJECTION_ADJUSTMENT  -advance
 
-    Sale with earning E, advance A already paid out:
-
-      approved  ->  FINAL_CREDIT          +(E - A)   "owed E, already got A"
-      rejected  ->  REJECTION_ADJUSTMENT  -A         "owed 0, already got A"
-
-The PDF's worked example, 3 sales of Rs 40 with Rs 4 advanced on each:
-
-      rejected:  -4
-      approved:  +36
-      approved:  +36
-                 ---
-                  68
-
-A sale is reconciled exactly once. The second attempt is a 409, not a silent
-overwrite -- re-reconciling would double-count the adjustment and there is no
-legitimate reason to do it.
+Assignment example (3 x Rs 40, Rs 4 advanced each, one rejected):
+-4 + 36 + 36 = 68.
 """
 
 from decimal import Decimal
@@ -36,13 +23,9 @@ TERMINAL_SALE_STATUSES = (SaleStatus.APPROVED, SaleStatus.REJECTED)
 
 
 def reconcile_sale(db: Session, sale_id: str, new_status: SaleStatus) -> Sale:
-    """Move a pending sale to approved/rejected and write its ledger entry.
-
-    The status change and the ledger entry commit together, so there is no
-    window in which a sale reads as approved but its credit is missing.
-    """
-    # with_for_update is a no-op on SQLite (BEGIN IMMEDIATE already serialises
-    # writers) and a real row lock on Postgres.
+    """Status change and ledger entry commit together. A sale reconciles
+    exactly once — the second attempt is a 409."""
+    # row lock on Postgres; no-op on SQLite (BEGIN IMMEDIATE covers it)
     sale = db.get(Sale, sale_id, with_for_update=True)
     if sale is None:
         raise NotFound(f"sale {sale_id} not found")
@@ -53,8 +36,7 @@ def reconcile_sale(db: Session, sale_id: str, new_status: SaleStatus) -> Sale:
         )
 
     if sale.status != SaleStatus.PENDING:
-        # .value: same-session objects hold the enum, DB-loaded ones a plain
-        # str; f-strings on str-Enums render "SaleStatus.APPROVED" on 3.11+.
+        # .value: f-strings on str-enums print "SaleStatus.APPROVED" on 3.11+
         raise InvalidTransition(
             f"sale {sale_id} is already {SaleStatus(sale.status).value}; "
             f"sales reconcile exactly once"
@@ -77,9 +59,7 @@ def reconcile_sale(db: Session, sale_id: str, new_status: SaleStatus) -> Sale:
     sale.status = new_status
     sale.reconciled_at = utcnow()
 
-    # A rejected sale that never received an advance owes nothing back, so
-    # there is nothing to record. Writing a zero row would be noise in the
-    # audit trail.
+    # rejected sale that never got an advance: nothing to record
     if amount != ZERO:
         db.add(
             LedgerEntry(

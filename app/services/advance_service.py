@@ -1,15 +1,8 @@
-"""Advance payout job.
+"""Advance payout job: 10% of earnings for every pending sale, exactly once.
 
-Business rule #1: every pending sale is eligible for an advance of 10% of its
-earnings, and once transferred the same sale must NEVER receive another advance
--- however many times the job runs, and however many instances run at once.
-
-The SELECT below filters out sales that already have an advance, but that is
-only an optimisation. The actual guarantee is the UNIQUE constraint on
-advance_payouts.sale_id: between our SELECT and our INSERT another job instance
-may insert the same row, and when it does we take an IntegrityError and skip.
-Run this job fifty times concurrently and each sale still gets exactly one
-advance.
+The eligibility SELECT is just an optimisation — the real guarantee is the
+unique constraint on advance_payouts.sale_id. If two job instances race, the
+loser gets an IntegrityError and skips.
 """
 
 import logging
@@ -30,18 +23,11 @@ TWO_PLACES = Decimal("0.01")
 
 
 def advance_amount_for(earning: Decimal) -> Decimal:
-    """10% of earnings, rounded half-up to paise. Decimal throughout: a float
-    here would make 10% of 40 come out as 4.000000000000001."""
     return (earning * ADVANCE_RATE).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
 
 
 def find_eligible_sales(db: Session) -> list[Sale]:
-    """Pending sales with no advance yet.
-
-    An anti-join (LEFT JOIN ... WHERE right IS NULL) rather than a NOT IN
-    subquery: it uses the index on advance_payouts.sale_id and does not have
-    NOT IN's NULL-handling trap.
-    """
+    """Pending sales that don't have an advance yet (anti-join)."""
     return list(
         db.execute(
             select(Sale)
@@ -54,22 +40,14 @@ def find_eligible_sales(db: Session) -> list[Sale]:
 
 
 def run_advance_payout_job(db: Session) -> dict:
-    """Pay a 10% advance on every eligible pending sale. Idempotent.
-
-    Returns counts of {advances_paid, skipped, failed}.
-
-    Ordering inside the savepoint matters: we INSERT and FLUSH *before* calling
-    the gateway. Flushing is what surfaces the UNIQUE violation, so a job
-    instance that loses the race finds out before it moves any money. Doing the
-    transfer first would mean the loser pays the user, then rolls back its own
-    record of having done so -- a real double-payment.
-    """
+    """Idempotent; safe to run repeatedly and concurrently."""
     paid, skipped, failed = 0, 0, 0
 
     for sale in find_eligible_sales(db):
         amount = advance_amount_for(sale.earning)
         try:
-            with db.begin_nested():  # savepoint: one bad sale can't poison the batch
+            # savepoint per sale so one failure doesn't kill the batch
+            with db.begin_nested():
                 db.add(
                     AdvancePayout(
                         id=new_id(),
@@ -79,16 +57,17 @@ def run_advance_payout_job(db: Session) -> dict:
                         transferred_at=utcnow(),
                     )
                 )
-                db.flush()  # raises IntegrityError here if another instance won
+                # flush BEFORE the transfer: if another instance already
+                # advanced this sale, the IntegrityError fires here — before
+                # any money moves. The other order would pay the user and then
+                # roll back the record of it.
+                db.flush()
                 transfer_funds_external(sale.user_id, amount, reference=sale.id)
             paid += 1
         except IntegrityError:
-            # Another job instance already advanced this sale. Exactly the
-            # outcome we want; not an error.
-            skipped += 1
+            skipped += 1  # another instance won the race, fine
         except TransferFailed:
-            # Savepoint rolled back, so no advance row exists and the sale
-            # stays eligible for the next run.
+            # savepoint rolled back, sale stays eligible for the next run
             logger.warning("advance transfer failed for sale %s", sale.id)
             failed += 1
 

@@ -1,10 +1,7 @@
-"""Shared test fixtures.
+"""Shared fixtures.
 
-The database is file-backed, not `:memory:`, on purpose. In-memory SQLite is
-private to a single connection, so the concurrency tests in later stages would
-be testing nothing -- two "racing" threads would each get their own empty
-database and both trivially succeed. A temp file gives them one real database
-to contend over.
+File-backed SQLite instead of :memory: — an in-memory db is private to one
+connection, so the concurrency tests would be racing against nothing.
 """
 
 import tempfile
@@ -12,15 +9,14 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from sqlalchemy.orm import sessionmaker
 
 from app.db import Base, _make_engine, register_sqlite_listeners
 from app.models import Sale, User
-from sqlalchemy.orm import sessionmaker
 
 
 @pytest.fixture
 def db_path():
-    """A fresh SQLite file per test, deleted afterwards."""
     with tempfile.TemporaryDirectory() as tmp:
         yield Path(tmp) / "test.db"
 
@@ -48,14 +44,9 @@ def db(session_factory):
 
 @pytest.fixture
 def client(session_factory):
-    """FastAPI TestClient wired to the per-test database.
-
-    Deliberately NOT used as a context manager: entering it would run the
-    lifespan handler, whose init_db() targets the global engine and would
-    drop a stray payouts.db into the working directory. The tables this
-    client needs already exist on the fixture engine, via dependency
-    override.
-    """
+    """TestClient wired to the per-test db. Not used as a context manager on
+    purpose — that would run the lifespan handler, whose init_db() targets
+    the real engine and would create a stray payouts.db."""
     from fastapi.testclient import TestClient
 
     from app.db import get_db
@@ -75,7 +66,6 @@ def client(session_factory):
 
 @pytest.fixture
 def john(db):
-    """The user from the assignment's worked example."""
     user = User(id="john_doe")
     db.add(user)
     db.commit()
@@ -84,7 +74,7 @@ def john(db):
 
 @pytest.fixture
 def three_sales(db, john):
-    """The exact scenario from the PDF: 3 pending sales of Rs 40 each."""
+    """The assignment example: 3 pending sales of Rs 40."""
     sales = [
         Sale(id=f"sale_{i}", user_id="john_doe", brand="brand_1", earning=Decimal("40.00"))
         for i in range(3)

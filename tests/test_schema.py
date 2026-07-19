@@ -1,8 +1,4 @@
-"""Stage 1: the schema-level guarantees everything else is built on.
-
-These tests assert that the database itself enforces the rules, so that no
-amount of buggy application code above it can violate them.
-"""
+"""Schema-level guarantees: the database itself enforces the money rules."""
 
 from decimal import Decimal
 
@@ -10,16 +6,12 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
-from app.models import AdvancePayout, LedgerEntry, Sale
 from app.enums import LedgerEntryType
+from app.models import AdvancePayout, LedgerEntry, Sale
 
 
 def test_foreign_keys_are_enforced(db, john):
-    """SQLite ignores FKs unless PRAGMA foreign_keys=ON is set per connection.
-
-    Without this the FK declarations in models.py would be decorative and
-    orphaned rows could accumulate silently.
-    """
+    # SQLite ignores FKs unless the pragma is set per connection
     assert db.execute(text("PRAGMA foreign_keys")).scalar() == 1
 
     db.add(Sale(id="orphan", user_id="ghost_user", brand="brand_1", earning=Decimal("10")))
@@ -29,19 +21,17 @@ def test_foreign_keys_are_enforced(db, john):
 
 
 def test_money_round_trips_as_exact_decimal(db, john):
-    """Money must never become a float. 10% of 40.00 has to be exactly 4.00."""
     db.add(Sale(id="s1", user_id="john_doe", brand="brand_1", earning=Decimal("40.00")))
     db.commit()
     db.expire_all()
 
     earning = db.get(Sale, "s1").earning
-    assert isinstance(earning, Decimal), "Money type leaked a float"
+    assert isinstance(earning, Decimal)
     assert earning == Decimal("40.00")
     assert (earning * Decimal("0.10")).quantize(Decimal("0.01")) == Decimal("4.00")
 
 
 def test_money_quantizes_to_two_places(db, john):
-    """Sub-paisa precision is rounded on write, so stored values are canonical."""
     db.add(Sale(id="s2", user_id="john_doe", brand="brand_1", earning=Decimal("33.333")))
     db.commit()
     db.expire_all()
@@ -49,13 +39,8 @@ def test_money_quantizes_to_two_places(db, john):
 
 
 def test_advance_never_paid_twice_for_same_sale(db, john):
-    """BUSINESS RULE #1, enforced by the database.
-
-    "Once an advance payout has been successfully transferred, the same sale
-    must never receive another advance payout, even if the job runs multiple
-    times." This holds no matter how many job instances race, because it is a
-    UNIQUE constraint rather than an application-level check.
-    """
+    """The unique constraint on sale_id is what enforces the one-advance rule,
+    regardless of how many job instances race."""
     db.add(Sale(id="s1", user_id="john_doe", brand="brand_1", earning=Decimal("40.00")))
     db.commit()
 
@@ -71,11 +56,6 @@ def test_advance_never_paid_twice_for_same_sale(db, john):
 
 
 def test_ledger_idempotency_key_is_unique(db, john):
-    """The key that makes duplicate webhooks and re-run jobs safe.
-
-    Two entries claiming the same logical event collide here, so the retry
-    becomes a no-op instead of double-crediting the user.
-    """
     for entry_id in ("l1", "l2"):
         db.add(
             LedgerEntry(

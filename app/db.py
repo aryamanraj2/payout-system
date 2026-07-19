@@ -1,20 +1,9 @@
-"""Engine, session factory, and the SQLite pragmas that make the concurrency
-guarantees in this system real rather than aspirational.
+"""Engine and session setup.
 
-Two things SQLite does not do by default, both of which we depend on:
-
-1. Foreign keys are NOT enforced unless `PRAGMA foreign_keys=ON` is issued on
-   every connection. Without it the FK declarations in models.py are decorative.
-
-2. pysqlite opens transactions lazily and in DEFERRED mode, so two writers can
-   both read a balance before either writes -- exactly the double-spend the
-   withdrawal path must prevent. `BEGIN IMMEDIATE` takes the write lock up
-   front, serializing writers. It cannot be issued with `session.execute()`
-   because SQLAlchemy has already opened a transaction by then; it has to be
-   emitted here, on the engine's `begin` event.
-
-On Postgres neither listener applies: FKs are always enforced, and the
-withdrawal path uses `SELECT ... FOR UPDATE` on the user row instead.
+SQLite needs two things configured per connection or the guarantees in this
+app don't hold: foreign keys (off by default), and BEGIN IMMEDIATE so writers
+are serialised (otherwise two withdrawals can both read the same balance).
+See docs/DESIGN.md.
 """
 
 import os
@@ -33,9 +22,8 @@ class Base(DeclarativeBase):
 def _make_engine(url: str = DATABASE_URL):
     kwargs: dict = {"echo": False}
     if url.startswith("sqlite"):
-        # check_same_thread=False so the threaded concurrency tests can share
-        # one engine across threads; the BEGIN IMMEDIATE lock is what actually
-        # keeps them correct.
+        # allow the engine to be shared across threads (tests race threads);
+        # BEGIN IMMEDIATE is what keeps that safe
         kwargs["connect_args"] = {"check_same_thread": False}
     return create_engine(url, **kwargs)
 
@@ -44,18 +32,13 @@ engine = _make_engine()
 
 
 def register_sqlite_listeners(target_engine) -> None:
-    """Attach the two SQLite-only listeners described in the module docstring."""
-
     @event.listens_for(target_engine, "connect")
     def _on_connect(dbapi_conn, _record):
-        # Disable pysqlite's implicit BEGIN so we can issue our own.
+        # disable pysqlite's implicit BEGIN so we can issue our own
         dbapi_conn.isolation_level = None
         cursor = dbapi_conn.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
-        # BEGIN IMMEDIATE makes writers queue. Without a busy timeout a waiting
-        # writer fails instantly with "database is locked" instead of waiting
-        # its turn, which would turn correct serialisation into spurious errors
-        # under concurrency.
+        # queued writers should wait for the lock, not fail instantly
         cursor.execute("PRAGMA busy_timeout=5000")
         cursor.close()
 
@@ -72,14 +55,12 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
 
 
 def init_db(target_engine=None) -> None:
-    """Create all tables. Real deployments would use Alembic migrations."""
-    from app import models  # noqa: F401  -- registers the mappers
+    from app import models  # noqa: F401  (registers the mappers)
 
     Base.metadata.create_all(target_engine or engine)
 
 
 def get_db():
-    """FastAPI dependency: one session per request, always closed."""
     db = SessionLocal()
     try:
         yield db

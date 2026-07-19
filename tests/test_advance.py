@@ -1,12 +1,7 @@
-"""Stage 2: the advance payout job.
-
-Tests are named after the business rules they prove.
-"""
+"""Advance payout job tests."""
 
 import threading
 from decimal import Decimal
-
-import pytest
 
 from app import gateway
 from app.enums import SaleStatus
@@ -23,13 +18,12 @@ def test_advance_is_ten_percent_of_earnings(db, three_sales):
     assert result["advances_paid"] == 3
     advances = db.query(AdvancePayout).all()
     assert len(advances) == 3
-    # The PDF: 3 sales of Rs 40, advance of Rs 4 each, Rs 12 total.
+    # assignment example: 3 x Rs 40 -> Rs 4 each, Rs 12 total
     assert all(a.amount == Decimal("4.00") for a in advances)
     assert sum(a.amount for a in advances) == Decimal("12.00")
 
 
 def test_advance_never_paid_twice(db, three_sales):
-    """BUSINESS RULE #1: running the job repeatedly must not re-pay a sale."""
     first = run_advance_payout_job(db)
     second = run_advance_payout_job(db)
     third = run_advance_payout_job(db)
@@ -42,8 +36,6 @@ def test_advance_never_paid_twice(db, three_sales):
 
 
 def test_only_pending_sales_are_eligible(db, john):
-    """Approved and rejected sales have already been reconciled; an advance on
-    them would be paying out against a settled sale."""
     db.add_all(
         [
             Sale(id="p", user_id="john_doe", brand="brand_1",
@@ -63,7 +55,6 @@ def test_only_pending_sales_are_eligible(db, john):
 
 
 def test_new_sale_added_later_gets_its_advance(db, three_sales):
-    """The job is incremental, not one-shot."""
     run_advance_payout_job(db)
 
     db.add(Sale(id="late", user_id="john_doe", brand="brand_2", earning=Decimal("50.00")))
@@ -77,9 +68,6 @@ def test_new_sale_added_later_gets_its_advance(db, three_sales):
 
 
 def test_failed_transfer_leaves_sale_eligible_for_retry(db, three_sales, monkeypatch):
-    """If the gateway declines, the savepoint rolls back and no advance row is
-    written -- so the sale is retried on the next run rather than being
-    silently marked as paid."""
     def always_fails(user_id, amount, reference):
         raise gateway.TransferFailed("gateway down")
 
@@ -89,7 +77,7 @@ def test_failed_transfer_leaves_sale_eligible_for_retry(db, three_sales, monkeyp
     assert result == {"advances_paid": 0, "skipped": 0, "failed": 3}
     assert db.query(AdvancePayout).count() == 0
 
-    # Gateway recovers; the next run pays them.
+    # gateway recovers, next run pays them
     monkeypatch.undo()
     result = run_advance_payout_job(db)
     assert result["advances_paid"] == 3
@@ -97,7 +85,6 @@ def test_failed_transfer_leaves_sale_eligible_for_retry(db, three_sales, monkeyp
 
 
 def test_partial_failure_does_not_poison_the_batch(db, john, monkeypatch):
-    """One failing sale must not prevent the others from being paid."""
     db.add_all(
         [
             Sale(id=f"s{i}", user_id="john_doe", brand="brand_1", earning=Decimal("40.00"))
@@ -120,29 +107,22 @@ def test_partial_failure_does_not_poison_the_batch(db, john, monkeypatch):
 
 
 def test_rounding_is_half_up_to_paise():
-    """Money never touches float. 10% of 33.33 is 3.33, not 3.3330000000000002."""
     assert advance_amount_for(Decimal("40.00")) == Decimal("4.00")
     assert advance_amount_for(Decimal("33.33")) == Decimal("3.33")
-    assert advance_amount_for(Decimal("0.05")) == Decimal("0.01")  # 0.005 -> half up
+    assert advance_amount_for(Decimal("0.05")) == Decimal("0.01")  # 0.005 rounds up
     assert advance_amount_for(Decimal("0.00")) == Decimal("0.00")
 
 
 def test_losing_racer_skips_instead_of_double_paying(db, three_sales, monkeypatch):
-    """THE RACE, forced deterministically.
-
-    Two job instances can both SELECT a sale as eligible before either INSERTs.
-    Under SQLite's BEGIN IMMEDIATE the writers serialise so tightly that this
-    window almost never opens naturally -- the threaded test below confirmed
-    `skipped` stays 0 -- which would leave the IntegrityError handler untested.
-
-    So we simulate the stale read directly: advance the sales, then hand the
-    job a SELECT result computed *before* that happened. This is exactly what a
-    losing instance sees, and it must skip rather than pay a second time.
-    """
+    """Two instances can both SELECT a sale as eligible before either inserts.
+    The threaded test below can't hit this window reliably (the locking is too
+    effective), so simulate the stale read directly: advance everything, then
+    hand the job a sale list from before that happened. It must skip, and it
+    must not have called the gateway."""
     run_advance_payout_job(db)
     assert db.query(AdvancePayout).count() == 3
 
-    stale_view = list(three_sales)  # what an instance that SELECTed earlier holds
+    stale_view = list(three_sales)
     monkeypatch.setattr(
         "app.services.advance_service.find_eligible_sales",
         lambda _db: stale_view,
@@ -157,19 +137,12 @@ def test_losing_racer_skips_instead_of_double_paying(db, three_sales, monkeypatc
     result = run_advance_payout_job(db)
 
     assert result == {"advances_paid": 0, "skipped": 3, "failed": 0}
-    assert paid_calls == [], "a losing racer moved money before hitting the constraint"
+    assert paid_calls == [], "money moved before the constraint was checked"
     assert db.query(AdvancePayout).count() == 3
 
 
 def test_concurrent_job_runs_pay_each_sale_exactly_once(session_factory, engine):
-    """Several job instances running at once, for real.
-
-    This asserts the end-state invariant only: exactly one advance per sale.
-    It does NOT reliably exercise the IntegrityError path -- write
-    serialisation usually means one worker claims everything and the rest find
-    nothing eligible. `test_losing_racer_skips_instead_of_double_paying` covers
-    that branch deterministically.
-    """
+    """Four instances at once; end state must be one advance per sale."""
     from app.models import User
 
     setup = session_factory()
@@ -189,9 +162,9 @@ def test_concurrent_job_runs_pay_each_sale_exactly_once(session_factory, engine)
     def worker():
         session = session_factory()
         try:
-            barrier.wait()  # maximise overlap
+            barrier.wait()
             run_advance_payout_job(session)
-        except Exception as exc:  # noqa: BLE001 - surfaced via assertion below
+        except Exception as exc:
             errors.append(exc)
         finally:
             session.close()
@@ -208,7 +181,6 @@ def test_concurrent_job_runs_pay_each_sale_exactly_once(session_factory, engine)
     advances = verify.query(AdvancePayout).all()
     verify.close()
 
-    # The invariant that matters: exactly one advance per sale, no duplicates.
     assert len(advances) == 5
     assert len({a.sale_id for a in advances}) == 5
     assert sum(a.amount for a in advances) == Decimal("20.00")

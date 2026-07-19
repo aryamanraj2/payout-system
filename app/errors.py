@@ -1,14 +1,7 @@
-"""Domain exceptions and their HTTP mapping.
+"""Domain exceptions. Services raise these; main.py maps them to HTTP once.
 
-Services raise these; routers stay thin and never construct HTTPException
-themselves. That keeps the service layer usable from a job runner or a CLI
-without dragging FastAPI along, and keeps the error contract in one place.
-
-    400  invalid input
-    404  not found
-    409  illegal state transition / duplicate
-    422  insufficient balance
-    429  24h withdrawal rate limit (carries retry_after)
+400 invalid input / 404 not found / 409 illegal transition
+422 insufficient balance / 429 withdrawal rate limit
 """
 
 from datetime import datetime
@@ -16,8 +9,6 @@ from decimal import Decimal
 
 
 class DomainError(Exception):
-    """Base for every business-rule violation. status_code drives the response."""
-
     status_code = 400
     code = "domain_error"
 
@@ -35,9 +26,6 @@ class NotFound(DomainError):
 
 
 class InvalidTransition(DomainError):
-    """A state change the state machine forbids, e.g. reconciling a sale twice
-    or moving a completed payout to failed."""
-
     status_code = 409
     code = "invalid_transition"
 
@@ -62,8 +50,6 @@ class InsufficientBalance(DomainError):
 
 
 class WithdrawalRateLimited(DomainError):
-    """Business rule #3: one withdrawal per 24 hours."""
-
     status_code = 429
     code = "withdrawal_rate_limited"
 

@@ -1,17 +1,3 @@
-"""ORM models.
-
-The two unique constraints in this file ARE business rules, not hygiene:
-
-  advance_payouts.sale_id UNIQUE
-      "the same sale must never receive another advance payout, even if the
-      advance payout job runs multiple times" -- enforced by the database, so
-      it holds no matter how many job instances race.
-
-  ledger_entries.idempotency_key UNIQUE
-      Duplicate webhook, re-run job, retried request: all collide here and are
-      swallowed as a no-op. Replaces every "did we already do this?" check.
-"""
-
 import uuid
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -41,17 +27,8 @@ def new_id() -> str:
 
 
 class UTCDateTime(TypeDecorator):
-    """Timezone-aware UTC timestamps, on a backend that does not store zones.
-
-    SQLite has no timestamp-with-zone type, so an aware datetime written here
-    comes back naive. That asymmetry is not cosmetic: `retry_after` is derived
-    from a payout's created_at, and mixing naive and aware datetimes raises
-    TypeError on subtraction -- so the 429 path would break precisely when a
-    rate-limited user hits it.
-
-    Normalising in both directions keeps every datetime in the application
-    aware and in UTC, whatever the backend.
-    """
+    """SQLite drops timezone info, so aware datetimes come back naive and
+    datetime arithmetic breaks. Normalise to aware UTC in both directions."""
 
     impl = DateTime
     cache_ok = True
@@ -60,7 +37,7 @@ class UTCDateTime(TypeDecorator):
         if value is None:
             return None
         if value.tzinfo is None:
-            return value  # already naive; assume UTC
+            return value
         return value.astimezone(timezone.utc).replace(tzinfo=None)
 
     def process_result_value(self, value: datetime | None, dialect):
@@ -70,13 +47,9 @@ class UTCDateTime(TypeDecorator):
 
 
 class Money(TypeDecorator):
-    """Exact decimal currency, stored as TEXT.
-
-    SQLAlchemy's Numeric type round-trips through float on SQLite and warns
-    about the lost precision. Storing the decimal as a zero-padded string keeps
-    the value exact and makes it portable: swap the impl for NUMERIC(12, 2) on
-    Postgres and nothing above this line changes.
-    """
+    """Decimal stored as TEXT. SQLAlchemy's Numeric goes through float on
+    SQLite, which is exactly what we're trying to avoid with money. Quantised
+    to 2 places on write. For Postgres, swap impl to NUMERIC(12,2)."""
 
     impl = String(20)
     cache_ok = True
@@ -95,7 +68,7 @@ class Money(TypeDecorator):
 class User(Base):
     __tablename__ = "users"
 
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # "john_doe"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # e.g. "john_doe"
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, nullable=False)
 
     sales: Mapped[list["Sale"]] = relationship(back_populates="user")
@@ -120,24 +93,22 @@ class Sale(Base):
     )
 
     __table_args__ = (
+        # money is stored as TEXT, so cast for the numeric comparison
         CheckConstraint("CAST(earning AS REAL) >= 0", name="ck_sales_earning_non_negative"),
         Index("idx_sales_user_status", "user_id", "status"),
     )
 
 
 class AdvancePayout(Base):
-    """Money already transferred out against a pending sale.
-
-    Deliberately NOT a ledger entry: this money has left the system, so it must
-    never appear in the withdrawable balance. Reconciliation nets it out.
-    """
+    """Money already transferred out against a pending sale. Not a ledger
+    entry on purpose — it left the system, so it's never withdrawable."""
 
     __tablename__ = "advance_payouts"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
-    sale_id: Mapped[str] = mapped_column(
-        ForeignKey("sales.id"), nullable=False, unique=True  # business rule #1
-    )
+    # unique: a sale can never receive a second advance, however many
+    # job instances race
+    sale_id: Mapped[str] = mapped_column(ForeignKey("sales.id"), nullable=False, unique=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
     amount: Mapped[Decimal] = mapped_column(Money, nullable=False)
     transferred_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, nullable=False)
@@ -146,8 +117,6 @@ class AdvancePayout(Base):
 
 
 class Payout(Base):
-    """An outbound withdrawal request with a gateway-driven lifecycle."""
-
     __tablename__ = "payouts"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
@@ -166,10 +135,8 @@ class Payout(Base):
 
 
 class LedgerEntry(Base):
-    """Append-only. Never UPDATE or DELETE a row here.
-
-    withdrawable_balance(user) = SUM(amount) WHERE user_id = ?
-    """
+    """Append-only — never update or delete rows here.
+    withdrawable balance = SUM(amount) per user."""
 
     __tablename__ = "ledger_entries"
 
@@ -179,6 +146,7 @@ class LedgerEntry(Base):
     amount: Mapped[Decimal] = mapped_column(Money, nullable=False)  # signed
     sale_id: Mapped[str | None] = mapped_column(ForeignKey("sales.id"), nullable=True)
     payout_id: Mapped[str | None] = mapped_column(ForeignKey("payouts.id"), nullable=True)
+    # e.g. "final:<sale_id>", "reversal:<payout_id>" — duplicates collide here
     idempotency_key: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, nullable=False)
 
