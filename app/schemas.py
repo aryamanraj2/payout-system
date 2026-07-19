@@ -45,6 +45,13 @@ class BalanceOut(BaseModel):
     withdrawable_balance: Decimal
 
 
+class PayoutWebhook(BaseModel):
+    """Gateway callback body. The gateway reports where the payout is now;
+    the state machine decides whether that report is legal."""
+
+    status: PayoutStatus = Field(..., examples=[PayoutStatus.FAILED])
+
+
 class WithdrawalRequest(BaseModel):
     amount: Decimal = Field(..., gt=0, examples=[Decimal("68.00")])
 

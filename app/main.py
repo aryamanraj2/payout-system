@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 
 from app.db import init_db
 from app.errors import DomainError, WithdrawalRateLimited
-from app.routers import admin, jobs, sales, users
+from app.routers import admin, jobs, sales, users, webhooks
 
 
 @asynccontextmanager
@@ -49,6 +49,7 @@ app.include_router(sales.router)
 app.include_router(jobs.router)
 app.include_router(admin.router)
 app.include_router(users.router)
+app.include_router(webhooks.router)
 
 
 @app.get("/health", tags=["meta"])

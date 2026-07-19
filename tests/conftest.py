@@ -47,6 +47,33 @@ def db(session_factory):
 
 
 @pytest.fixture
+def client(session_factory):
+    """FastAPI TestClient wired to the per-test database.
+
+    Deliberately NOT used as a context manager: entering it would run the
+    lifespan handler, whose init_db() targets the global engine and would
+    drop a stray payouts.db into the working directory. The tables this
+    client needs already exist on the fixture engine, via dependency
+    override.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.db import get_db
+    from app.main import app
+
+    def override():
+        s = session_factory()
+        try:
+            yield s
+        finally:
+            s.close()
+
+    app.dependency_overrides[get_db] = override
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
 def john(db):
     """The user from the assignment's worked example."""
     user = User(id="john_doe")
