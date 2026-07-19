@@ -89,3 +89,52 @@ def test_webhook_unknown_payout_is_404(client, john):
 def test_webhook_invalid_status_is_422(client, payout_id):
     r = client.post(f"/webhooks/payouts/{payout_id}", json={"status": "exploded"})
     assert r.status_code == 422  # Pydantic rejects it before the service runs
+
+
+# --------------------------------------------------------------------------
+# Stage 5.4: the whole assignment in one test, over HTTP.
+# --------------------------------------------------------------------------
+
+
+def test_q2_full_cycle_over_http(client, payout_id):
+    """The complete Q2 story through the public API.
+
+    A rate-limited user's payout fails; they must be able to withdraw again
+    immediately. The 429 assertions in the middle prove the second withdrawal
+    succeeds *because of* the failure handling, not because the rate limit
+    was never in play.
+    """
+    # The 24h slot is occupied by the initiated payout...
+    r = client.post("/users/john_doe/withdrawals", json={"amount": 1.00})
+    assert r.status_code == 429
+    assert "retry_after" in r.json()
+    assert int(r.headers["Retry-After"]) > 0
+
+    # ...the gateway fails the payout...
+    r = client.post(f"/webhooks/payouts/{payout_id}", json={"status": "failed"})
+    assert r.status_code == 200
+    assert _balance(client) == "68.00"
+
+    # ...and the same user can now withdraw again, immediately.
+    r = client.post("/users/john_doe/withdrawals", json={"amount": 68.00})
+    assert r.status_code == 201
+    retry_id = r.json()["id"]
+    assert retry_id != payout_id
+    assert _balance(client) == "0.00"
+
+    # The retry completes; nothing comes back this time.
+    client.post(f"/webhooks/payouts/{retry_id}", json={"status": "processing"})
+    r = client.post(f"/webhooks/payouts/{retry_id}", json={"status": "completed"})
+    assert r.status_code == 200
+    assert _balance(client) == "0.00"
+
+    # Final audit trail: the ledger tells the entire story in order.
+    types = [e["entry_type"] for e in client.get("/users/john_doe/ledger").json()]
+    assert types == [
+        "REJECTION_ADJUSTMENT",   # sale rejected:        -4
+        "FINAL_CREDIT",           # sale approved:       +36
+        "FINAL_CREDIT",           # sale approved:       +36
+        "WITHDRAWAL_DEBIT",       # first withdrawal:    -68
+        "WITHDRAWAL_REVERSAL",    # gateway failure:     +68
+        "WITHDRAWAL_DEBIT",       # retry withdrawal:    -68
+    ]

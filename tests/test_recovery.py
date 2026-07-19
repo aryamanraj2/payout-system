@@ -177,6 +177,88 @@ def test_duplicate_failure_webhook_credits_once(db, payout):
     assert db.query(LedgerEntry).filter_by(payout_id=payout.id).count() == 2
 
 
+# --------------------------------------------------------------------------
+# Stage 5.4: Q2 end to end -- "allow the user to initiate another withdrawal
+# for that amount". The reversal (5.2) and the 24h exclusion (Stage 4) are
+# each proven in isolation; these tests prove they COMPOSE.
+# --------------------------------------------------------------------------
+
+
+def test_user_can_withdraw_again_after_failure(db, payout):
+    """THE Q2 REQUIREMENT, full loop.
+
+    Withdraw 68 -> gateway fails it -> balance restored -> the user withdraws
+    the same 68 again, immediately. Two rules must cooperate for the second
+    call to succeed: the reversal must have restored the balance, and the
+    failed payout must not occupy the 24h slot. If either breaks, this fails.
+    """
+    handle_payout_status_update(db, payout.id, PayoutStatus.FAILED)
+    assert get_withdrawable_balance(db, "john_doe") == Decimal("68.00")
+
+    retry = request_withdrawal(db, "john_doe", Decimal("68.00"))
+
+    assert retry.id != payout.id
+    assert retry.status == PayoutStatus.INITIATED
+    assert get_withdrawable_balance(db, "john_doe") == Decimal("0.00")
+
+    # Audit trail tells the whole story: two debits, one reversal.
+    entries = db.query(LedgerEntry).filter(LedgerEntry.payout_id.isnot(None)).all()
+    types = sorted(e.entry_type for e in entries)
+    assert types == [
+        LedgerEntryType.WITHDRAWAL_DEBIT,
+        LedgerEntryType.WITHDRAWAL_DEBIT,
+        LedgerEntryType.WITHDRAWAL_REVERSAL,
+    ]
+
+
+def test_retry_payout_can_complete_normally(db, payout):
+    """The retry is an ordinary payout: it completes without a reversal, and
+    the money is genuinely gone."""
+    handle_payout_status_update(db, payout.id, PayoutStatus.FAILED)
+    retry = request_withdrawal(db, "john_doe", Decimal("68.00"))
+
+    handle_payout_status_update(db, retry.id, PayoutStatus.PROCESSING)
+    handle_payout_status_update(db, retry.id, PayoutStatus.COMPLETED)
+
+    assert get_withdrawable_balance(db, "john_doe") == Decimal("0.00")
+    assert (
+        db.query(LedgerEntry)
+        .filter_by(idempotency_key=f"reversal:{retry.id}")
+        .count()
+        == 0
+    )
+
+
+def test_partial_rewithdrawal_after_failure(db, payout):
+    """The user need not retry the same amount; the restored balance is
+    ordinary balance."""
+    handle_payout_status_update(db, payout.id, PayoutStatus.CANCELLED)
+
+    request_withdrawal(db, "john_doe", Decimal("30.00"))
+
+    assert get_withdrawable_balance(db, "john_doe") == Decimal("38.00")
+
+
+def test_failure_loop_is_repeatable(db, payout):
+    """Withdraw -> fail -> withdraw -> fail -> withdraw. Each cycle stands on
+    its own reversal key, so no iteration is mistaken for a replay of the
+    last."""
+    current = payout
+    for _ in range(3):
+        handle_payout_status_update(db, current.id, PayoutStatus.FAILED)
+        assert get_withdrawable_balance(db, "john_doe") == Decimal("68.00")
+        current = request_withdrawal(db, "john_doe", Decimal("68.00"))
+        assert get_withdrawable_balance(db, "john_doe") == Decimal("0.00")
+
+    # 4 payouts total (original + 3 retries), 3 reversals, sum still exact.
+    assert db.query(LedgerEntry).filter_by(
+        entry_type=LedgerEntryType.WITHDRAWAL_DEBIT
+    ).count() == 4
+    assert db.query(LedgerEntry).filter_by(
+        entry_type=LedgerEntryType.WITHDRAWAL_REVERSAL
+    ).count() == 3
+
+
 def test_reversal_unique_key_holds_even_if_state_machine_is_bypassed(db, payout):
     """DEFENSE IN DEPTH. The state machine makes a second reversal unreachable;
     this test asks what happens if that layer is lost -- a bug, a manual DB
