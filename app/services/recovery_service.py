@@ -81,12 +81,16 @@ def handle_payout_status_update(
 def _write_reversal(db: Session, payout: Payout) -> None:
     """Credit the failed payout back, exactly once.
 
-    The savepoint + explicit flush matter: flush is what forces the INSERT to
-    the database *inside* begin_nested(), so a duplicate `reversal:{id}` key
-    raises IntegrityError here, rolls back only the savepoint, and leaves the
-    status change (made outside it) intact. Without the flush the INSERT would
-    ride along with the outer commit, where the IntegrityError would abort the
-    whole transaction, status change included.
+    The savepoint is the load-bearing part. A duplicate `reversal:{id}` key
+    raises IntegrityError inside begin_nested(), which rolls back only the
+    savepoint and leaves the status change (made outside it) intact. Removing
+    the savepoint was tested: the duplicate key then poisons the whole session
+    (PendingRollbackError) and the status change is lost with it.
+
+    The explicit flush, honestly, is redundant -- exiting begin_nested()
+    commits the savepoint and that commit flushes, still inside this try. It
+    stays because it pins the failure to a named line instead of a context
+    manager exit, which makes the traceback readable.
     """
     try:
         with db.begin_nested():
