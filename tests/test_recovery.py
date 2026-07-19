@@ -8,9 +8,11 @@ from decimal import Decimal
 
 import pytest
 
-from app.enums import PayoutStatus, SaleStatus
+from app.enums import LedgerEntryType, PayoutStatus, SaleStatus
 from app.errors import InvalidTransition, NotFound
+from app.models import LedgerEntry
 from app.services.advance_service import run_advance_payout_job
+from app.services.balance_service import get_withdrawable_balance
 from app.services.reconciliation_service import reconcile_sale
 from app.services.recovery_service import handle_payout_status_update
 from app.services.withdrawal_service import request_withdrawal
@@ -98,3 +100,104 @@ def test_no_terminal_state_has_an_exit(db, payout):
 def test_unknown_payout_is_not_found(db, john):
     with pytest.raises(NotFound):
         handle_payout_status_update(db, "nope", PayoutStatus.FAILED)
+
+
+# --------------------------------------------------------------------------
+# Stage 5.2: the reversal -- Q2's "credit the failed payout amount back".
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        [PayoutStatus.FAILED],                              # initiated -> failed
+        [PayoutStatus.CANCELLED],                           # initiated -> cancelled
+        [PayoutStatus.PROCESSING, PayoutStatus.FAILED],     # via processing
+        [PayoutStatus.PROCESSING, PayoutStatus.REJECTED],   # via processing
+    ],
+    ids=["failed", "cancelled", "processing-failed", "processing-rejected"],
+)
+def test_terminal_failure_credits_amount_back(db, payout, route):
+    """Q2: every terminal-failure route restores the withdrawable balance."""
+    assert get_withdrawable_balance(db, "john_doe") == Decimal("0.00")
+
+    for status in route:
+        handle_payout_status_update(db, payout.id, status)
+
+    assert get_withdrawable_balance(db, "john_doe") == Decimal("68.00")
+
+    reversal = db.query(LedgerEntry).filter_by(
+        idempotency_key=f"reversal:{payout.id}"
+    ).one()
+    assert reversal.entry_type == LedgerEntryType.WITHDRAWAL_REVERSAL
+    assert reversal.amount == Decimal("68.00")
+
+
+def test_reversal_compensates_rather_than_deletes(db, payout):
+    """The audit trail keeps both movements forever: debit -68, reversal +68.
+
+    Recovery must never rewrite history -- a regulator (or a confused user)
+    can always see the money leave and come back.
+    """
+    handle_payout_status_update(db, payout.id, PayoutStatus.FAILED)
+
+    entries = db.query(LedgerEntry).filter_by(payout_id=payout.id).all()
+    by_type = {e.entry_type: e.amount for e in entries}
+    assert by_type == {
+        LedgerEntryType.WITHDRAWAL_DEBIT: Decimal("-68.00"),
+        LedgerEntryType.WITHDRAWAL_REVERSAL: Decimal("68.00"),
+    }
+
+
+def test_completed_payout_is_never_reversed(db, payout):
+    """The money genuinely left: no reversal, and the late 'failed' webhook
+    that would have created one is rejected."""
+    handle_payout_status_update(db, payout.id, PayoutStatus.PROCESSING)
+    handle_payout_status_update(db, payout.id, PayoutStatus.COMPLETED)
+
+    with pytest.raises(InvalidTransition):
+        handle_payout_status_update(db, payout.id, PayoutStatus.FAILED)
+
+    assert get_withdrawable_balance(db, "john_doe") == Decimal("0.00")
+    assert (
+        db.query(LedgerEntry)
+        .filter_by(idempotency_key=f"reversal:{payout.id}")
+        .count()
+        == 0
+    )
+
+
+def test_duplicate_failure_webhook_credits_once(db, payout):
+    """A redelivered 'failed' webhook is a same-status no-op: one reversal."""
+    handle_payout_status_update(db, payout.id, PayoutStatus.FAILED)
+    handle_payout_status_update(db, payout.id, PayoutStatus.FAILED)
+    handle_payout_status_update(db, payout.id, PayoutStatus.FAILED)
+
+    assert get_withdrawable_balance(db, "john_doe") == Decimal("68.00")
+    assert db.query(LedgerEntry).filter_by(payout_id=payout.id).count() == 2
+
+
+def test_reversal_unique_key_holds_even_if_state_machine_is_bypassed(db, payout):
+    """DEFENSE IN DEPTH. The state machine makes a second reversal unreachable;
+    this test asks what happens if that layer is lost -- a bug, a manual DB
+    edit, a future refactor. Simulate it by resetting the payout to processing
+    behind the service's back, then failing it again. The UNIQUE
+    `reversal:{payout_id}` key must swallow the second credit, and the status
+    change itself must survive (that is what the savepoint+flush protect).
+    """
+    handle_payout_status_update(db, payout.id, PayoutStatus.FAILED)
+    assert get_withdrawable_balance(db, "john_doe") == Decimal("68.00")
+
+    payout.status = PayoutStatus.PROCESSING  # bypass: rewind terminal state
+    db.commit()
+
+    updated = handle_payout_status_update(db, payout.id, PayoutStatus.FAILED)
+
+    assert updated.status == PayoutStatus.FAILED  # transition survived
+    assert get_withdrawable_balance(db, "john_doe") == Decimal("68.00")  # no 2nd credit
+    assert (
+        db.query(LedgerEntry)
+        .filter_by(idempotency_key=f"reversal:{payout.id}")
+        .count()
+        == 1
+    )
