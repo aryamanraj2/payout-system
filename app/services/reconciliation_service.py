@@ -53,8 +53,11 @@ def reconcile_sale(db: Session, sale_id: str, new_status: SaleStatus) -> Sale:
         )
 
     if sale.status != SaleStatus.PENDING:
+        # .value: same-session objects hold the enum, DB-loaded ones a plain
+        # str; f-strings on str-Enums render "SaleStatus.APPROVED" on 3.11+.
         raise InvalidTransition(
-            f"sale {sale_id} is already {sale.status}; sales reconcile exactly once"
+            f"sale {sale_id} is already {SaleStatus(sale.status).value}; "
+            f"sales reconcile exactly once"
         )
 
     advance = db.execute(
