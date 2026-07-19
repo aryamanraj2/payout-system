@@ -40,6 +40,35 @@ def new_id() -> str:
     return uuid.uuid4().hex
 
 
+class UTCDateTime(TypeDecorator):
+    """Timezone-aware UTC timestamps, on a backend that does not store zones.
+
+    SQLite has no timestamp-with-zone type, so an aware datetime written here
+    comes back naive. That asymmetry is not cosmetic: `retry_after` is derived
+    from a payout's created_at, and mixing naive and aware datetimes raises
+    TypeError on subtraction -- so the 429 path would break precisely when a
+    rate-limited user hits it.
+
+    Normalising in both directions keeps every datetime in the application
+    aware and in UTC, whatever the backend.
+    """
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value: datetime | None, dialect):
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value  # already naive; assume UTC
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    def process_result_value(self, value: datetime | None, dialect):
+        if value is None:
+            return None
+        return value.replace(tzinfo=timezone.utc)
+
+
 class Money(TypeDecorator):
     """Exact decimal currency, stored as TEXT.
 
@@ -67,7 +96,7 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)  # "john_doe"
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, nullable=False)
 
     sales: Mapped[list["Sale"]] = relationship(back_populates="user")
 
@@ -82,8 +111,8 @@ class Sale(Base):
     status: Mapped[SaleStatus] = mapped_column(
         String(16), default=SaleStatus.PENDING, nullable=False
     )
-    reconciled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    reconciled_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, nullable=False)
 
     user: Mapped[User] = relationship(back_populates="sales")
     advance: Mapped["AdvancePayout | None"] = relationship(
@@ -111,7 +140,7 @@ class AdvancePayout(Base):
     )
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
     amount: Mapped[Decimal] = mapped_column(Money, nullable=False)
-    transferred_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    transferred_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, nullable=False)
 
     sale: Mapped[Sale] = relationship(back_populates="advance")
 
@@ -127,8 +156,8 @@ class Payout(Base):
     status: Mapped[PayoutStatus] = mapped_column(
         String(16), default=PayoutStatus.INITIATED, nullable=False
     )
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, nullable=False)
 
     __table_args__ = (
         CheckConstraint("CAST(amount AS REAL) > 0", name="ck_payouts_amount_positive"),
@@ -151,6 +180,6 @@ class LedgerEntry(Base):
     sale_id: Mapped[str | None] = mapped_column(ForeignKey("sales.id"), nullable=True)
     payout_id: Mapped[str | None] = mapped_column(ForeignKey("payouts.id"), nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, nullable=False)
 
     __table_args__ = (Index("idx_ledger_user", "user_id"),)

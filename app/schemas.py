@@ -9,7 +9,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.enums import LedgerEntryType, SaleStatus
+from app.enums import LedgerEntryType, PayoutStatus, SaleStatus
 
 
 class SaleCreate(BaseModel):
@@ -43,6 +43,21 @@ class ReconcileRequest(BaseModel):
 class BalanceOut(BaseModel):
     user_id: str
     withdrawable_balance: Decimal
+
+
+class WithdrawalRequest(BaseModel):
+    amount: Decimal = Field(..., gt=0, examples=[Decimal("68.00")])
+
+
+class PayoutOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    user_id: str
+    amount: Decimal
+    status: PayoutStatus
+    created_at: datetime
+    updated_at: datetime
 
 
 class LedgerEntryOut(BaseModel):
