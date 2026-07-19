@@ -52,6 +52,11 @@ def register_sqlite_listeners(target_engine) -> None:
         dbapi_conn.isolation_level = None
         cursor = dbapi_conn.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
+        # BEGIN IMMEDIATE makes writers queue. Without a busy timeout a waiting
+        # writer fails instantly with "database is locked" instead of waiting
+        # its turn, which would turn correct serialisation into spurious errors
+        # under concurrency.
+        cursor.execute("PRAGMA busy_timeout=5000")
         cursor.close()
 
     @event.listens_for(target_engine, "begin")
